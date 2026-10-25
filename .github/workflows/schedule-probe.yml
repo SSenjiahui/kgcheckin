@@ -1,0 +1,11 @@
+name: schedule-probe
+on:
+  schedule:
+    - cron: '35 14 * * *'
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 探针
+        run: echo "schedule fired at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
