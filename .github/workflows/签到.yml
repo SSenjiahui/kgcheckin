@@ -2,10 +2,20 @@ name: 签到
 on:
   workflow_dispatch:
   schedule:
+    # GitHub 对 fork 仓库的 schedule 命中率极低、延迟可达数小时，
+    # 所以一天铺 4 个时间点（UTC），对应北京时间 01:10 / 04:10 / 07:10 / 10:10。
+    # 签到是幂等的：当天已领过会立刻返回「今日已领取」+「次数已用光」，几秒退出，不会重复消耗。
     - cron: '10 17 * * *'
+    - cron: '10 20 * * *'
+    - cron: '10 23 * * *'
+    - cron: '10 2 * * *'
 permissions:
   contents: read
   actions: write
+# 多个 cron 因延迟可能撞车，排队执行而不是互相取消，避免打断正在进行的领取
+concurrency:
+  group: kgcheckin-checkin
+  cancel-in-progress: false
 jobs:
   run:
     runs-on: ubuntu-latest

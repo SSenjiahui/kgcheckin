@@ -4,6 +4,27 @@ import { maskDisplayName, maskIdentifier, sanitizeForLog, summarizeResponse } fr
 import { sendNotify } from "./utils/notify.js";
 import { close_api, delay, send, startService, waitForApi } from "./utils/utils.js";
 
+/**
+ * 领取一次 VIP，带自动重试。
+ * 酷狗接口偶发返回 30000（服务端繁忙/风控），这类错误重试几次通常就过了；
+ * 30002 表示「今日次数已用光」，属于正常终止条件，不重试。
+ */
+async function claimVip(headers, maxRetry = 2) {
+  let last = null
+  for (let attempt = 0; attempt <= maxRetry; attempt++) {
+    const resp = await send(`/youth/vip?timestrap=${Date.now()}`, "GET", headers)
+    last = resp
+    if (resp.status === 1) return { ok: true, exhausted: false, resp }
+    if (resp.error_code === 30002) return { ok: false, exhausted: true, resp }
+    if (attempt < maxRetry) {
+      const waitMs = 5000 * (attempt + 1)
+      printYellow(`领取返回异常(${resp.error_code ?? '未知'})，${waitMs / 1000}s 后重试...`)
+      await delay(waitMs)
+    }
+  }
+  return { ok: false, exhausted: false, resp: last }
+}
+
 async function main() {
 
   const USERINFO = process.env.USERINFO
@@ -104,20 +125,21 @@ async function main() {
         let claimTotal = 0
         for (let i = 1; i <= 8; i++) {
           // ad获取vip
-          const ad = await send(`/youth/vip?timestrap=${Date.now()}`, "GET", headers)
+          const r = await claimVip(headers)
           claimTotal = i
-          if (ad.status === 1) {
+          if (r.ok) {
             printGreen(`第${i}次领取成功`)
             claimCount++
             if (i != 8) {
               await delay(30 * 1000)
             }
-          } else if (ad.error_code === 30002) {
+          } else if (r.exhausted) {
             printGreen("今天次数已用光")
             break
           } else {
-            printRed(`第${i}次领取失败`)
-            errorMsg[`${safeNickname} ad`] = summarizeResponse(ad)
+            // 重试后仍然失败，视为该账号本轮领取异常，中断本账号但不再让整个任务失败
+            printRed(`第${i}次领取失败（已重试）`)
+            errorMsg[`${safeNickname} ad`] = summarizeResponse(r.resp)
             hasError = true
             break
           }
@@ -135,11 +157,17 @@ async function main() {
           hasError = true
         }
 
+        // 今日已领取且一次都没领到 → 说明今天早就签完了，属于正常状态
+        const alreadyDone = listenStatus === '今日已领取' && claimCount === 0
+        let status = '成功'
+        if (listenStatus === '失败') status = '部分失败'
+        else if (claimCount === 0 && !alreadyDone) status = '部分失败'
+
         notifyResults.push({
           nickname: safeNickname,
-          status: listenStatus === '失败' || claimCount === 0 ? '部分失败' : '成功',
+          status,
           listen: listenStatus,
-          vipClaim: `${claimCount}/${claimTotal}`,
+          vipClaim: alreadyDone ? '今日已完成' : `${claimCount}/${claimTotal}`,
           vipExpiry,
           error: ''
         })
@@ -175,10 +203,13 @@ async function main() {
       } catch (error) {
         printRed("token刷新失败")
         console.dir(sanitizeForLog({ message: error.message }), { depth: null })
-        secretError = new Error("secret <USERINFO> token刷新失败")
+        // 不再抛出：签到本身已经跑完，PAT 失效属于配置问题。
+        // 让它变成红叉只会掩盖真实结果，改为写进通知里告警。
+        secretError = (error && error.message ? error.message : String(error)).split('\n')[0]
       }
     } else {
       printYellow("存在账号需要刷新token，但是未配置PAT，未刷新token最多两个月后过期")
+      secretError = "未配置 PAT"
     }
   }
 
@@ -193,11 +224,17 @@ async function main() {
   for (const r of notifyResults) {
     content += `\n【${r.nickname}】\n`
     content += `  🎵 听歌领取: ${r.listen}\n`
-    content += `  🎁 VIP领取: ${r.vipClaim} 次\n`
+    content += `  🎁 VIP领取: ${r.vipClaim}\n`
     content += `  ⏰ VIP到期: ${r.vipExpiry}\n`
     if (r.error) {
       content += `  ⚠️ 错误: ${r.error}\n`
     }
+  }
+
+  if (secretError) {
+    content += `\n🔧 配置告警: token 刷新后未能写回 Secret\n`
+    content += `  原因: ${secretError}\n`
+    content += `  → 请更新仓库 Secret「PAT」（需 Secrets 读写权限）后重新运行\n`
   }
 
   // 发送通知（确保即使 secret 更新失败也能发出）
@@ -210,11 +247,17 @@ async function main() {
   if (Object.keys(errorMsg).length > 0) {
     printRed("异常信息如下:")
     console.dir(sanitizeForLog(errorMsg), { depth: null })
-    throw new Error("领取异常")
+  }
+
+  // 只有「所有账号都没领到任何东西」才算整体失败。
+  // 单个账号偶发 30000、或某天已签过，都不应该把 job 染红。
+  const anySuccess = notifyResults.some(r => r.status === '成功')
+  if (!anySuccess) {
+    throw new Error("所有账号均未领取成功")
   }
 
   if (secretError) {
-    throw secretError
+    printYellow(`注意：PAT 失效导致 token 未能写回 Secret（${secretError}），请尽快更新 PAT`)
   }
 
 }

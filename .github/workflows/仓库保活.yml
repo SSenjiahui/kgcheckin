@@ -2,15 +2,21 @@ name: 仓库保活
 
 on:
   schedule:
-    # 每月 1 号运行一次，避免仓库未更新导致 Actions 被禁用
-    - cron: '0 0 1 * *'
+    # 每天一次。fork 出来的仓库只要 60 天没有提交，GitHub 就会停用其中的 scheduled workflow，
+    # 而且被停用后不会自动恢复，必须手动去 Actions 页面点启用。所以保活要勤，不能按月的来。
+    - cron: '0 0 * * *'
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kgcheckin-keepalive
+  cancel-in-progress: false
 
 jobs:
   keepalive:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
       - name: 检出仓库
@@ -44,7 +50,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "无变更"
           else
-            git commit -m "chore: keepalive at $(date -u +'%Y-%m-%d')"
+            git commit -m "chore: keepalive at $(date -u +'%Y-%m-%d') [skip ci]"
             git push
             echo "保活提交成功"
           fi
