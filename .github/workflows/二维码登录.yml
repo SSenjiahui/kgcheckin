@@ -1,0 +1,175 @@
+name: 二维码登录
+on:
+  workflow_dispatch:
+    inputs:
+      number:
+        description: "需要登录几个账号？"
+        required: true
+        default: "1"
+      append_user:
+        description: "是否追加新账号？（不删除已存在账号信息）"
+        required: true
+        type: choice
+        default: "否"
+        options:
+          - 是
+          - 否
+      print_userinfo:
+        description: "自动写入失败时是否在日志输出 USERINFO？（含登录token，默认否）"
+        required: true
+        type: choice
+        default: "否"
+        options:
+          - 否
+          - 是
+# 需要 contents: write 才能创建 Release 上传二维码直链
+permissions:
+  contents: write
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 创建 Node 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'npm'
+          cache-dependency-path: ./api/package-lock.json
+
+      - name: 检查 GitHub CLI
+        run: |
+          if ! command -v gh >/dev/null 2>&1; then
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt update
+            sudo apt install gh -y
+          fi
+          gh --version
+
+      - name: 缓存依赖
+        id: cache-npm
+        uses: actions/cache@v4
+        with:
+          path: ./api/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('./api/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: 安装依赖
+        run: npm run install
+        if: ${{ steps.cache-npm.outputs.cache-hit != 'true' }}
+
+      # ════════════════════════════════════════════
+      #   步骤一：生成二维码 → PNG + Summary + HTML 登录页
+      #   ✅ 完成后立即结束 step（process.exit(0) 保证干净退出）
+      #   ════════════════════════════════════════════
+      - name: 生成二维码图片与HTML登录页
+        id: gen
+        run: node qrcodeLogin.js gen
+        env:
+          NUMBER: ${{ github.event.inputs.number }}
+
+      # ════════════════════════════════════════════
+      #   步骤二（核心）：发布二维码为 GitHub Release 直链
+      #   浏览器点击链接即显示图片/网页，无需下载解压
+      #   ════════════════════════════════════════════
+      - name: 发布二维码图片直链（👈 点击即可查看，无需下载解压）
+        id: publish
+        if: ${{ always() && steps.gen.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="qr-${{ github.run_id }}"
+          gh release create "$TAG" qr/*.png qr/login.html \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "酷狗扫码登录二维码" \
+            --notes "用「酷狗音乐 APP」扫描下方二维码完成登录（约 2 分钟内有效）"
+
+          echo ""
+          echo "═══════════════════════════════════════════════════════"
+          echo "  📱 点击下方链接，浏览器直接显示二维码图片（无需解压）："
+          echo "═══════════════════════════════════════════════════════"
+          for f in qr/*.png; do
+            echo "  🔗 https://github.com/${{ github.repository }}/releases/download/$TAG/$(basename "$f")"
+          done
+          echo "═══════════════════════════════════════════════════════"
+
+          # 写入 Summary 页面，用户直接在 Summary 即可看到扫码链接
+          {
+            echo "## 🎵 酷狗音乐扫码登录"
+            echo ""
+            echo "请点击下方链接，浏览器打开即可扫码（约 2 分钟内有效）："
+            echo ""
+            for f in qr/*.png; do
+              echo "- 🔗 [账号 $(basename "$f" .png | sed 's/qr-//')] https://github.com/${{ github.repository }}/releases/download/$TAG/$(basename "$f")"
+            done
+            echo ""
+            echo "🌐 [HTML 登录页（含所有二维码）](https://github.com/${{ github.repository }}/releases/download/$TAG/login.html)"
+            echo ""
+            echo "⏳ 二维码有效期约 2 分钟，请尽快扫描"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ═══ 备用：HTML 仍上传为 artifact（万一 Release 失败兜底）═══
+      - name: 上传二维码 HTML 页面（兜底备份）
+        if: ${{ always() && steps.gen.outcome == 'success' && steps.publish.outcome != 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: 二维码HTML
+          path: |
+            qr/login.html
+            qr/qr-*.html
+          retention-days: 1
+          if-no-files-found: warn
+
+      # ═══ 错误处理 ═══
+      - name: 二维码生成失败提示
+        if: ${{ failure() }}
+        run: |
+          echo "::error::❌ 二维码生成失败"
+          echo ""
+          echo "排查方向："
+          echo "  1️⃣ 运行器网络是否能访问酷狗接口（查看上方步骤日志）"
+          echo "  2️⃣ npm 依赖安装是否成功"
+
+      # ════════════════════════════════════════════
+      #   步骤三：轮询等待用户扫码确认
+      #   ════════════════════════════════════════════
+      - name: 等待扫码登录
+        if: ${{ always() && steps.gen.outcome == 'success' }}
+        run: node qrcodeLogin.js wait
+        env:
+          USERINFO: ${{ secrets.USERINFO }}
+          APPEND_USER: ${{ github.event.inputs.append_user }}
+          ALLOW_PRINT_USERINFO: ${{ github.event.inputs.print_userinfo }}
+          PAT: ${{ secrets.PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+
+      # ═══ 清理：登录完成后立即删除本次 Release 及同名 Tag（不堆积）═══
+      - name: 清理本次二维码 Release 及 Tag
+        if: ${{ always() && steps.publish.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="qr-${{ github.run_id }}"
+          gh release delete "$TAG" --cleanup-tag --repo "$GITHUB_REPOSITORY" -y 2>/dev/null \
+            && echo "✅ 已删除本次 Release 及 Tag: $TAG" || echo "⚠️ Release/Tag $TAG 不存在或已删除"
+
+      # ═══ 兜底：清理残留的旧二维码 Release（保留最近 3 个）═══
+      - name: 清理旧的二维码 Release 及 Tag
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            | awk '$1 ~ /^qr-/ {print $1}' | head -n -3 \
+            | while read t; do
+                gh release delete "$t" --cleanup-tag --repo "$GITHUB_REPOSITORY" -y 2>/dev/null
+                echo "已删除旧 Release 及 Tag: $t"
+              done || true
